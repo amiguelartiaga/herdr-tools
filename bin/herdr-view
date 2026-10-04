@@ -180,14 +180,21 @@ def emit_png(png, c, r, out):
 
 
 def parse_pages(spec):
-    if "-" in spec:
-        a, b = spec.split("-", 1)
-        return int(a), int(b)
-    return int(spec), int(spec)
+    try:
+        if "-" in spec:
+            a, b = spec.split("-", 1)
+            first, last = int(a), int(b)
+        else:
+            first = last = int(spec)
+    except ValueError:
+        die(f"invalid page spec '{spec}': use a page number (3) or a range (2-5)")
+    if first < 1 or last < first:
+        die(f"invalid page range '{spec}'")
+    return first, last
 
 
 def main():
-    ap = argparse.ArgumentParser(add_help=False)
+    ap = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     ap.add_argument("files", nargs="*")
     ap.add_argument("-p", "--page", default="1")
     ap.add_argument("-r", "--dpi", type=int, default=110)

@@ -20,6 +20,16 @@ list_files() {
     | grep -iE "\.($exts)$" | sort -rn | cut -d' ' -f2-
 }
 
+# tolerate --p/--r/--w/--H typed with two dashes
+norm=()
+for a in "$@"; do
+  case "$a" in
+    --p) a=-p ;; --r) a=-r ;; --w) a=-w ;; --H) a=-H ;; --i) a=-i ;;
+  esac
+  norm+=("$a")
+done
+set -- "${norm[@]}"
+
 opts=()
 files=()
 inline=0
