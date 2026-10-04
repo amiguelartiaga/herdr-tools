@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""herdr-view - show PNG, JPG, WEBP, GIF or PDF files inline in a herdr pane.
+
+Emits the Kitty graphics protocol, which herdr forwards to the outer terminal
+(kitty, ghostty, wezterm). Works over SSH, so install it on remote hosts too.
+
+Usage: herdr-view [options] FILE...
+  -p, --page N | A-B   PDF page or page range (default: 1)
+  -r, --dpi DPI        PDF rasterisation resolution (default: 110)
+  -w, --width COLS     max width in terminal columns (default: terminal width)
+  -H, --height ROWS    max height in terminal rows (default: terminal height - 2)
+  -q, --quiet          no file name caption
+  -h, --help           this help
+
+Dependencies: none for PNG. JPG/WEBP/GIF need Pillow, or ImageMagick, or ffmpeg.
+PDF needs pdftoppm (poppler), or PyMuPDF, or ghostscript, or ImageMagick.
+"""
+import argparse
+import base64
+import fcntl
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import termios
+
+CHUNK = 4096
+
+
+def die(msg):
+    print(f"herdr-view: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def term_geometry():
+    """(cols, rows, cell_w_px, cell_h_px); pixel sizes are 0 when unknown."""
+    for fd in (sys.stdout.fileno(), sys.stdin.fileno(), 2):
+        try:
+            rows, cols, xpx, ypx = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+            if cols:
+                return cols, rows, (xpx // cols if cols and xpx else 0), (ypx // rows if rows and ypx else 0)
+        except OSError:
+            pass
+    size = shutil.get_terminal_size((80, 24))
+    return size.columns, size.lines, 0, 0
+
+
+def png_size(data):
+    if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return None
+    w, h = struct.unpack(">II", data[16:24])
+    return w, h
+
+
+class RenderError(Exception):
+    pass
+
+
+def run(cmd, **kw):
+    try:
+        return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw).stdout
+    except subprocess.CalledProcessError as e:
+        msg = e.stderr.decode(errors="replace").strip().splitlines()
+        raise RenderError(f"{cmd[0]} failed: {msg[0] if msg else e.returncode}") from None
+
+
+def to_png(path):
+    """Return PNG bytes for a raster image file."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if png_size(data):
+        return data
+    try:
+        from PIL import Image
+        import io
+        with Image.open(path) as im:
+            im = im.convert("RGBA") if im.mode not in ("RGB", "RGBA", "L") else im
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            return buf.getvalue()
+    except ImportError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        die(f"Pillow could not read {path}: {e}")
+    try:
+        for conv in (["magick", path, "png:-"], ["convert", path, "png:-"]):
+            if shutil.which(conv[0]):
+                return run(conv)
+        if shutil.which("ffmpeg"):
+            return run(["ffmpeg", "-v", "error", "-i", path, "-f", "image2", "-vcodec", "png", "-"])
+    except RenderError as e:
+        die(str(e))
+    die(f"cannot convert {path}: install Pillow (pip install pillow), ImageMagick or ffmpeg")
+
+
+def _pdf_pdftoppm(path, first, last, dpi):
+    if not shutil.which("pdftoppm"):
+        return None
+    import glob
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="herdr-view-") as tmp:
+        prefix = os.path.join(tmp, "p")
+        run(["pdftoppm", "-png", "-r", str(dpi), "-f", str(first), "-l", str(last), path, prefix])
+        files = sorted(glob.glob(prefix + "*.png"))
+        if not files:
+            raise RenderError("pdftoppm produced no pages (page out of range?)")
+        return [open(f, "rb").read() for f in files]
+
+
+def _pdf_fitz(path, first, last, dpi):
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return None
+    doc = fitz.open(path)
+    return [doc[p - 1].get_pixmap(dpi=dpi).tobytes("png")
+            for p in range(first, min(last, doc.page_count) + 1)]
+
+
+def _pdf_gs(path, first, last, dpi):
+    if not shutil.which("gs"):
+        return None
+    return [run(["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=png16m", f"-r{dpi}",
+                 f"-dFirstPage={p}", f"-dLastPage={p}", "-sOutputFile=-", path])
+            for p in range(first, last + 1)]
+
+
+def _pdf_magick(path, first, last, dpi):
+    conv = shutil.which("magick") or shutil.which("convert")
+    if not conv:
+        return None
+    return [run([conv, "-density", str(dpi), f"{path}[{p - 1}]", "-background", "white",
+                 "-alpha", "remove", "png:-"]) for p in range(first, last + 1)]
+
+
+def pdf_pages(path, first, last, dpi):
+    """Return PNG bytes for each requested page, trying each renderer in turn."""
+    errors = []
+    for renderer in (_pdf_pdftoppm, _pdf_fitz, _pdf_gs, _pdf_magick):
+        try:
+            pages = renderer(path, first, last, dpi)
+        except RenderError as e:
+            errors.append(str(e))
+            continue
+        if pages:
+            return pages
+    if errors:
+        die("; ".join(errors))
+    die("no PDF renderer found: install poppler (pdftoppm), PyMuPDF (pip install pymupdf), ghostscript or ImageMagick")
+
+
+def fit(img_w, img_h, cols, rows, cell_w, cell_h, max_cols, max_rows):
+    """Choose (c, r) cell dimensions preserving aspect ratio."""
+    max_cols = max(1, min(max_cols or cols - 1, cols - 1))
+    max_rows = max(1, min(max_rows or rows - 2, rows - 2))
+    if not (cell_w and cell_h):
+        # No pixel info: assume cells are twice as tall as wide.
+        cell_w, cell_h = 1, 2
+        img_w, img_h = img_w, img_h
+    w_cells = img_w / cell_w
+    h_cells = img_h / cell_h
+    scale = min(1.0, max_cols / w_cells, max_rows / h_cells)
+    c = max(1, round(w_cells * scale))
+    r = max(1, round(h_cells * scale))
+    return c, r
+
+
+def emit_png(png, c, r, out):
+    payload = base64.b64encode(png)
+    first = True
+    for i in range(0, len(payload), CHUNK):
+        chunk = payload[i:i + CHUNK]
+        more = 1 if i + CHUNK < len(payload) else 0
+        ctrl = f"a=T,f=100,t=d,q=2,c={c},r={r},m={more}" if first else f"m={more}"
+        out.write(b"\x1b_G" + ctrl.encode() + b";" + chunk + b"\x1b\\")
+        first = False
+    out.write(b"\n")
+    out.flush()
+
+
+def parse_pages(spec):
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        return int(a), int(b)
+    return int(spec), int(spec)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("files", nargs="*")
+    ap.add_argument("-p", "--page", default="1")
+    ap.add_argument("-r", "--dpi", type=int, default=110)
+    ap.add_argument("-w", "--width", type=int, default=0)
+    ap.add_argument("-H", "--height", type=int, default=0)
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args()
+    if args.help or not args.files:
+        print(__doc__.strip())
+        sys.exit(0 if args.help else 2)
+
+    cols, rows, cell_w, cell_h = term_geometry()
+    out = sys.stdout.buffer
+    for path in args.files:
+        if not os.path.isfile(path):
+            die(f"no such file: {path}")
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".pdf":
+            first, last = parse_pages(args.page)
+            images = ((f"{path} [page {p}]", png) for p, png in
+                      zip(range(first, last + 1), pdf_pages(path, first, last, args.dpi)))
+        else:
+            images = ((path, to_png(path)),)
+        for caption, png in images:
+            size = png_size(png)
+            if not size:
+                die(f"no image for {caption} (page out of range, or the renderer failed)")
+            c, r = fit(*size, cols, rows, cell_w, cell_h, args.width, args.height)
+            if not args.quiet:
+                print(f"{caption}  {size[0]}x{size[1]}", flush=True)
+            emit_png(png, c, r, out)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# v - view images and PDFs in the terminal with as little typing as possible.
+#
+#   v                 list images/PDFs in the current directory, newest first, numbered
+#   v N               view entry N of that list (a bare number is always an index; use ./N for a file named N)
+#   v FILE...         view the given files (tab completion works as usual)
+#   v -p 3 FILE.pdf   any option is passed to herdr-view (-p page, -r dpi, -w cols, -H rows)
+#   v -i FILE.pdf     force inline rendering of a PDF even if tdf is installed
+#
+# Images are shown inline with herdr-view (Kitty graphics: works in kitty, ghostty,
+# wezterm, and inside herdr panes shown in those terminals). PDFs open in tdf when it
+# is installed, so you can scroll pages; otherwise the first page is shown inline.
+set -euo pipefail
+
+exts='png|jpg|jpeg|webp|gif|bmp|tif|tiff|pdf'
+
+list_files() {
+  # newest first, regular files only, case-insensitive on extension
+  find . -maxdepth 1 -type f -printf '%T@ %P\n' 2>/dev/null \
+    | grep -iE "\.($exts)$" | sort -rn | cut -d' ' -f2-
+}
+
+opts=()
+files=()
+inline=0
+for a in "$@"; do
+  case "$a" in
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -i|--inline) inline=1 ;;
+    -*) opts+=("$a") ;;
+    *) files+=("$a") ;;
+  esac
+done
+# options that take a value: keep the value with the option
+if ((${#opts[@]})); then
+  fixed=(); i=0; args=("$@")
+  while ((i < ${#args[@]})); do
+    case "${args[i]}" in
+      -p|--page|-r|--dpi|-w|--width|-H|--height) fixed+=("${args[i]}" "${args[i+1]:-}"); i=$((i+2)) ;;
+      -i|--inline|-h|--help) i=$((i+1)) ;;
+      -*) fixed+=("${args[i]}"); i=$((i+1)) ;;
+      *) i=$((i+1)) ;;
+    esac
+  done
+  opts=("${fixed[@]}")
+  # values consumed by options must not be treated as files
+  files=(); i=0
+  while ((i < ${#args[@]})); do
+    case "${args[i]}" in
+      -p|--page|-r|--dpi|-w|--width|-H|--height) i=$((i+2)) ;;
+      -*) i=$((i+1)) ;;
+      *) files+=("${args[i]}"); i=$((i+1)) ;;
+    esac
+  done
+fi
+
+if ((${#files[@]} == 0)); then
+  mapfile -t all < <(list_files)
+  if ((${#all[@]} == 0)); then
+    echo "v: no images or PDFs in $PWD" >&2; exit 1
+  fi
+  n=1
+  for f in "${all[@]}"; do printf '%3d  %s\n' "$n" "$f"; n=$((n+1)); done
+  echo "v N to view one" >&2
+  exit 0
+fi
+
+# numeric arguments always pick from the listing (use ./7 for a file literally named 7)
+resolved=()
+for f in "${files[@]}"; do
+  if [[ $f =~ ^[0-9]+$ ]]; then
+    mapfile -t all < <(list_files)
+    if ((f < 1 || f > ${#all[@]})); then echo "v: no entry $f (have ${#all[@]})" >&2; exit 1; fi
+    resolved+=("${all[f-1]}")
+  else
+    resolved+=("$f")
+  fi
+done
+
+status=0
+for f in "${resolved[@]}"; do
+  [[ -f $f ]] || { echo "v: no such file: $f" >&2; status=1; continue; }
+  if [[ ${f,,} == *.pdf && $inline == 0 && ${#opts[@]} == 0 ]] && command -v tdf >/dev/null && [[ -t 1 ]]; then
+    tdf "$f" || status=1
+  else
+    herdr-view "${opts[@]}" "$f" || status=1
+  fi
+done
+exit $status

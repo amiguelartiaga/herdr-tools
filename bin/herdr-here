@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# herdr-here - open a local terminal on the machine and directory herdr is showing.
+#
+# Reads the selected saved machine from `herdr machine list --json` and the
+# focused pane's cwd from `herdr [--machine LABEL] pane list`, then launches a
+# terminal: a local one in that directory, or an ssh session that cd's there.
+#
+# Usage: herdr-here [options]
+#   -m, --machine LABEL   use this saved machine instead of the selected one
+#   -l, --local           force the local herdr session
+#   -t, --terminal NAME   terminal to use: default | kitty | foot | alacritty | ghostty
+#                         (default = the Omarchy/xdg default terminal)
+#   -v, --view [FILE]     after opening, show FILE (default: newest png/jpg/webp/gif/pdf
+#                         in that directory) with herdr-view, then leave a shell
+#   -n, --dry-run         print the command instead of running it
+#   -h, --help            show this help
+#
+# Environment:
+#   HERDR_HERE_TERMINAL     same as --terminal
+#   HERDR_HERE_SSH_OPTS     extra ssh options (default: -X)
+#   HERDR_HERE_REMOTE_SHELL command run on the remote after cd (default: exec bash -l)
+
+set -euo pipefail
+
+terminal="${HERDR_HERE_TERMINAL:-default}"
+ssh_opts="${HERDR_HERE_SSH_OPTS--X}"
+remote_shell="${HERDR_HERE_REMOTE_SHELL:-exec bash -l}"
+machine=""
+force_local=0
+dry_run=0
+view=0
+view_file=""
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while (($#)); do
+  case "$1" in
+    -m|--machine) machine="$2"; shift 2 ;;
+    -l|--local) force_local=1; shift ;;
+    -t|--terminal) terminal="$2"; shift 2 ;;
+    -v|--view) view=1; shift; if (($#)) && [[ $1 != -* ]]; then view_file="$1"; shift; fi ;;
+    -n|--dry-run) dry_run=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "herdr-here: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+fail() {
+  echo "herdr-here: $*" >&2
+  command -v notify-send >/dev/null && notify-send -a herdr-here "herdr-here" "$*" || true
+  exit 1
+}
+
+command -v herdr >/dev/null || fail "herdr not found in PATH"
+command -v jq >/dev/null || fail "jq not found in PATH"
+
+# 1. Which machine is herdr showing?
+label="" target=""
+if ((force_local == 0)); then
+  if [[ -n $machine ]]; then
+    read -r label target < <(herdr machine list --json 2>/dev/null \
+      | jq -r --arg m "$machine" '.[] | select(.enabled and (.label == $m or .id == $m)) | [.label, .target] | @tsv' \
+      | head -1) || true
+    [[ -n $label ]] || fail "no enabled saved machine named '$machine'"
+  else
+    read -r label target < <(herdr machine list --json 2>/dev/null \
+      | jq -r '.[] | select(.enabled and .selected) | [.label, .target] | @tsv' \
+      | head -1) || true
+  fi
+fi
+
+# 2. Which directory is the focused pane in?
+if [[ -n $label ]]; then
+  panes=$(herdr --machine "$label" pane list 2>/dev/null) || fail "cannot reach herdr on $label"
+else
+  panes=$(herdr pane list 2>/dev/null) || fail "cannot reach the local herdr server"
+fi
+cwd=$(jq -r '.result.panes[] | select(.focused) | (.foreground_cwd // .cwd // empty)' <<<"$panes" | head -1)
+
+# 3. Build the command.
+view_cmd=""
+if ((view)); then
+  if [[ -n $view_file ]]; then
+    pick="f=$(printf '%q' "$view_file")"
+  else
+    pick='f=$(ls -t -- *.png *.jpg *.jpeg *.webp *.gif *.pdf *.PNG *.JPG *.JPEG *.PDF 2>/dev/null | head -1)'
+  fi
+  view_cmd="$pick; if [ -n \"\$f\" ]; then PATH=\"\$HOME/.local/bin:\$PATH\" herdr-view \"\$f\"; else echo \"herdr-here: no image or pdf in \$PWD\"; fi; "
+fi
+
+if [[ -n $label ]]; then
+  if [[ -n $cwd ]]; then
+    remote_cmd="cd -- $(printf '%q' "$cwd") 2>/dev/null || echo \"herdr-here: cannot cd to $cwd\"; $view_cmd$remote_shell"
+  else
+    remote_cmd="$view_cmd$remote_shell"
+  fi
+  # shellcheck disable=SC2206  # ssh_opts is intentionally word-split
+  cmd=(ssh $ssh_opts -t "$target" "$remote_cmd")
+  title="$label: ${cwd:-~}"
+  dir=""
+else
+  cmd=()
+  ((view)) && cmd=(bash -lc "${view_cmd}exec bash -l")
+  title="local: ${cwd:-~}"
+  dir="${cwd:-$HOME}"
+fi
+
+case "$terminal" in
+  default)
+    launch=(xdg-terminal-exec "--title=$title")
+    [[ -n $dir ]] && launch+=("--dir=$dir")
+    ((${#cmd[@]})) && launch+=(-- "${cmd[@]}")
+    ;;
+  kitty)
+    launch=(kitty --title "$title")
+    [[ -n $dir ]] && launch+=(--directory "$dir")
+    ((${#cmd[@]})) && launch+=("${cmd[@]}")
+    ;;
+  foot)
+    launch=(foot --title "$title")
+    [[ -n $dir ]] && launch+=(--working-directory "$dir")
+    ((${#cmd[@]})) && launch+=("${cmd[@]}")
+    ;;
+  alacritty)
+    launch=(alacritty --title "$title")
+    [[ -n $dir ]] && launch+=(--working-directory "$dir")
+    ((${#cmd[@]})) && launch+=(-e "${cmd[@]}")
+    ;;
+  ghostty)
+    launch=(ghostty "--title=$title")
+    [[ -n $dir ]] && launch+=("--working-directory=$dir")
+    ((${#cmd[@]})) && launch+=(-e "${cmd[@]}")
+    ;;
+  *) fail "unknown terminal '$terminal'" ;;
+esac
+
+if ((dry_run)); then
+  printf 'machine:   %s\n' "${label:-local}"
+  printf 'directory: %s\n' "${cwd:-(unknown)}"
+  printf 'command:  '; printf ' %q' "${launch[@]}"; echo
+  exit 0
+fi
+
+[[ $terminal == default ]] || command -v "$terminal" >/dev/null || fail "$terminal is not installed"
+
+if command -v uwsm-app >/dev/null; then
+  exec setsid uwsm-app -- "${launch[@]}"
+else
+  exec setsid "${launch[@]}" >/dev/null 2>&1
+fi
