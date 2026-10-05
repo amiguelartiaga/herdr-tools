@@ -10,6 +10,7 @@ Usage: herdr-view [options] FILE...
   -w, --width COLS     max width in terminal columns (default: terminal width)
   -H, --height ROWS    max height in terminal rows (default: terminal height - 2)
   -q, --quiet          no file name caption
+  --pages              print the page count of each PDF and exit
   -h, --help           this help
 
 Dependencies: none for PNG. JPG/WEBP/GIF need Pillow, or ImageMagick, or ffmpeg.
@@ -150,6 +151,36 @@ def pdf_pages(path, first, last, dpi):
     die("no PDF renderer found: install poppler (pdftoppm), PyMuPDF (pip install pymupdf), ghostscript or ImageMagick")
 
 
+def pdf_page_count(path):
+    """Number of pages, or 0 when no tool can tell."""
+    if shutil.which("pdfinfo"):
+        try:
+            for line in run(["pdfinfo", path]).decode(errors="replace").splitlines():
+                if line.startswith("Pages:"):
+                    return int(line.split()[1])
+        except (RenderError, ValueError, IndexError):
+            pass
+    try:
+        import fitz
+        return fitz.open(path).page_count
+    except Exception:  # noqa: BLE001
+        pass
+    if shutil.which("gs"):
+        for extra in ([f"--permit-file-read={path}"], ["-dNOSAFER"]):
+            try:
+                out = run(["gs", "-q", "-dNODISPLAY", *extra, "-c",
+                           f"({path}) (r) file runpdfbegin pdfpagecount = quit"])
+                return int(out.decode().strip().splitlines()[-1])
+            except (RenderError, ValueError, IndexError):
+                continue
+    if shutil.which("identify"):
+        try:
+            return len(run(["identify", "-format", "%p\n", path]).decode().split())
+        except RenderError:
+            pass
+    return 0
+
+
 def fit(img_w, img_h, cols, rows, cell_w, cell_h, max_cols, max_rows):
     """Choose (c, r) cell dimensions preserving aspect ratio."""
     max_cols = max(1, min(max_cols or cols - 1, cols - 1))
@@ -201,11 +232,19 @@ def main():
     ap.add_argument("-w", "--width", type=int, default=0)
     ap.add_argument("-H", "--height", type=int, default=0)
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("--pages", action="store_true", help="print the page count of each PDF and exit")
     ap.add_argument("-h", "--help", action="store_true")
     args = ap.parse_args()
     if args.help or not args.files:
         print(__doc__.strip())
         sys.exit(0 if args.help else 2)
+
+    if args.pages:
+        for path in args.files:
+            if not os.path.isfile(path):
+                die(f"no such file: {path}")
+            print(pdf_page_count(path))
+        return
 
     cols, rows, cell_w, cell_h = term_geometry()
     out = sys.stdout.buffer

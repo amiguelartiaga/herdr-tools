@@ -77,12 +77,15 @@ v                 list images/PDFs in the current directory, newest first, numbe
 v N               view entry N of that list
 v FILE...         view the given files
 v -p 3 FILE.pdf   options are passed through to herdr-view
-v -i FILE.pdf     inline first page even if tdf is installed
+v -i FILE.pdf     page through a PDF inline even if tdf is installed
+v -a FILE.pdf     dump all pages inline, one after another
 ```
 
 Images go through herdr-view. PDFs open in [tdf](https://github.com/itsjunetime/tdf)
-when it is installed, so you can scroll pages; otherwise the first page is
-rendered inline.
+when it is installed, so you can scroll pages. Otherwise v pages through them
+itself: Enter shows the next page, `p` the previous one, a number jumps to that
+page, `a` dumps the rest and `q` quits. Each page is rendered on demand, so
+large PDFs open instantly.
 
 ## herdr-view
 
@@ -93,6 +96,7 @@ herdr-view [options] FILE...
   -w, --width COLS     max width in terminal columns (default: terminal width)
   -H, --height ROWS    max height in terminal rows (default: terminal height - 2)
   -q, --quiet          no file name caption
+  --pages              print the page count of each PDF and exit
 ```
 
 It emits the Kitty graphics protocol. herdr parses it on the server side and

@@ -6,10 +6,12 @@
 #   v FILE...         view the given files (tab completion works as usual)
 #   v -p 3 FILE.pdf   any option is passed to herdr-view (-p page, -r dpi, -w cols, -H rows)
 #   v -i FILE.pdf     force inline rendering of a PDF even if tdf is installed
+#   v -a FILE.pdf     dump all pages inline, one after another
 #
 # Images are shown inline with herdr-view (Kitty graphics: works in kitty, ghostty,
 # wezterm, and inside herdr panes shown in those terminals). PDFs open in tdf when it
-# is installed, so you can scroll pages; otherwise the first page is shown inline.
+# is installed, so you can scroll pages. Otherwise v pages through them itself:
+# Enter = next page, p = previous, a number = go to that page, a = all, q = quit.
 set -euo pipefail
 
 exts='png|jpg|jpeg|webp|gif|bmp|tif|tiff|pdf'
@@ -24,7 +26,7 @@ list_files() {
 norm=()
 for a in "$@"; do
   case "$a" in
-    --p) a=-p ;; --r) a=-r ;; --w) a=-w ;; --H) a=-H ;; --i) a=-i ;;
+    --p) a=-p ;; --r) a=-r ;; --w) a=-w ;; --H) a=-H ;; --i) a=-i ;; --a) a=-a ;;
   esac
   norm+=("$a")
 done
@@ -33,10 +35,12 @@ set -- "${norm[@]}"
 opts=()
 files=()
 inline=0
+all=0
 for a in "$@"; do
   case "$a" in
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -i|--inline) inline=1 ;;
+    -a|--all) all=1 ;;
     -*) opts+=("$a") ;;
     *) files+=("$a") ;;
   esac
@@ -47,7 +51,7 @@ if ((${#opts[@]})); then
   while ((i < ${#args[@]})); do
     case "${args[i]}" in
       -p|--page|-r|--dpi|-w|--width|-H|--height) fixed+=("${args[i]}" "${args[i+1]:-}"); i=$((i+2)) ;;
-      -i|--inline|-h|--help) i=$((i+1)) ;;
+      -i|--inline|-a|--all|-h|--help) i=$((i+1)) ;;
       -*) fixed+=("${args[i]}"); i=$((i+1)) ;;
       *) i=$((i+1)) ;;
     esac
@@ -87,11 +91,44 @@ for f in "${files[@]}"; do
   fi
 done
 
+# Page through a PDF inline: Enter next, p previous, N goto, a all, q quit.
+page_pdf() {
+  local f=$1 count n=1 ans
+  count=$(herdr-view --pages "$f" 2>/dev/null || echo 0)
+  if ((all)); then
+    if ((count > 0)); then herdr-view "${opts[@]}" -p "1-$count" "$f"; else herdr-view "${opts[@]}" "$f"; fi
+    return
+  fi
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    herdr-view "${opts[@]}" "$f"
+    return
+  fi
+  while :; do
+    printf '\033[2J\033[H'
+    herdr-view "${opts[@]}" -p "$n" "$f" || return 1
+    read -r -p "page $n${count:+/$count}  [Enter next, p prev, N goto, a all, q quit] " ans </dev/tty || ans=q
+    case "$ans" in
+      q|Q) return 0 ;;
+      p|P) ((n > 1)) && n=$((n-1)) ;;
+      a|A) printf '\033[2J\033[H'; herdr-view "${opts[@]}" -p "1-${count:-1}" "$f"; return ;;
+      "" ) if ((count == 0 || n < count)); then n=$((n+1)); else return 0; fi ;;
+      *[!0-9]*) ;;
+      *) if ((ans >= 1 && (count == 0 || ans <= count))); then n=$ans; fi ;;
+    esac
+  done
+}
+
 status=0
 for f in "${resolved[@]}"; do
   [[ -f $f ]] || { echo "v: no such file: $f" >&2; status=1; continue; }
-  if [[ ${f,,} == *.pdf && $inline == 0 && ${#opts[@]} == 0 ]] && command -v tdf >/dev/null && [[ -t 1 ]]; then
-    tdf "$f" || status=1
+  if [[ ${f,,} == *.pdf ]]; then
+    if [[ $inline == 0 && $all == 0 && ${#opts[@]} == 0 ]] && command -v tdf >/dev/null && [[ -t 1 ]]; then
+      tdf "$f" || status=1
+    elif [[ ${opts[*]} == *-p* || ${opts[*]} == *--page* ]]; then
+      herdr-view "${opts[@]}" "$f" || status=1
+    else
+      page_pdf "$f" || status=1
+    fi
   else
     herdr-view "${opts[@]}" "$f" || status=1
   fi
